@@ -2,9 +2,9 @@ import telebot
 from telebot import types
 import json
 import os
+import time
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-
 MODERATORS_FILE = "moderators.json"
 
 def load_moderators():
@@ -22,21 +22,30 @@ def get_all_mods():
     return data["admins"] + data["moderators"]
 
 def is_admin(user_id):
-    data = load_moderators()
-    return user_id in data["admins"]
+    return user_id in load_moderators()["admins"]
 
 def is_moderator(user_id):
     return user_id in get_all_mods()
 
-pending_photos = {}
-photo_counter = [0]
+# Хранилище заявок
+# submissions[sid] = {"user_id": ..., "user_name": ..., "photos": [file_id, ...], "status": "pending"}
+submissions = {}
+sub_counter = [0]
+
+# Буфер для группировки фото от одного пользователя
+# buffer[user_id] = {"photos": [...], "timer": timestamp}
+photo_buffer = {}
+BUFFER_SECONDS = 3  # ждём 3 секунды после последнего фото
+
 waiting_rejection_reason = {}
 
-def next_id():
-    photo_counter[0] += 1
-    return str(photo_counter[0])
+def next_sid():
+    sub_counter[0] += 1
+    return str(sub_counter[0])
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# ── Команды ──────────────────────────────────────────────
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
@@ -44,8 +53,7 @@ def cmd_start(message):
     if is_moderator(uid):
         bot.send_message(uid,
             "👋 Привет, модератор!\n\n"
-            "Команды:\n"
-            "/pending — фото на проверке\n"
+            "/pending — заявки на проверке\n"
             "/addmod ID — добавить модератора\n"
             "/removemod ID — удалить модератора\n"
             "/listmods — список модераторов"
@@ -53,7 +61,7 @@ def cmd_start(message):
     else:
         bot.send_message(uid,
             "👋 Привет!\n\n"
-            "Отправь мне фотографии — она попадёт на проверку к модератору.\n"
+            "Отправь фотографии (можно сразу несколько) — они попадут на проверку.\n"
             "Ты получишь уведомление о решении."
         )
 
@@ -64,12 +72,11 @@ def cmd_setup(message):
     if len(data["admins"]) == 0:
         data["admins"].append(uid)
         save_moderators(data)
-        bot.send_message(uid, f"✅ Вы добавлены как первый администратор!\nВаш ID: {uid}")
+        bot.send_message(uid, f"✅ Вы первый администратор! Ваш ID: {uid}")
+    elif is_admin(uid):
+        bot.send_message(uid, f"Вы уже администратор. ID: {uid}")
     else:
-        if is_admin(uid):
-            bot.send_message(uid, f"Вы уже администратор. Ваш ID: {uid}")
-        else:
-            bot.send_message(uid, "❌ Администратор уже установлен.")
+        bot.send_message(uid, "❌ Администратор уже установлен.")
 
 @bot.message_handler(commands=["addmod"])
 def cmd_addmod(message):
@@ -82,19 +89,19 @@ def cmd_addmod(message):
         bot.send_message(uid, "Использование: /addmod 123456789")
         return
     try:
-        new_mod_id = int(parts[1])
+        new_id = int(parts[1])
     except ValueError:
         bot.send_message(uid, "❌ Неверный ID.")
         return
     data = load_moderators()
-    if new_mod_id in data["admins"] or new_mod_id in data["moderators"]:
-        bot.send_message(uid, "ℹ️ Этот пользователь уже модератор или администратор.")
+    if new_id in data["admins"] or new_id in data["moderators"]:
+        bot.send_message(uid, "ℹ️ Уже модератор.")
         return
-    data["moderators"].append(new_mod_id)
+    data["moderators"].append(new_id)
     save_moderators(data)
-    bot.send_message(uid, f"✅ Пользователь {new_mod_id} добавлен как модератор.")
+    bot.send_message(uid, f"✅ {new_id} добавлен как модератор.")
     try:
-        bot.send_message(new_mod_id, "🎉 Вы назначены модератором! Напишите /start чтобы начать.")
+        bot.send_message(new_id, "🎉 Вы назначены модератором! Напишите /start.")
     except:
         pass
 
@@ -102,7 +109,7 @@ def cmd_addmod(message):
 def cmd_removemod(message):
     uid = message.from_user.id
     if not is_admin(uid):
-        bot.send_message(uid, "❌ Только администраторы могут удалять модераторов.")
+        bot.send_message(uid, "❌ Нет прав.")
         return
     parts = message.text.split()
     if len(parts) < 2:
@@ -118,22 +125,19 @@ def cmd_removemod(message):
         data["moderators"].remove(rem_id)
         save_moderators(data)
         bot.send_message(uid, f"✅ Модератор {rem_id} удалён.")
-    elif rem_id in data["admins"]:
-        bot.send_message(uid, "❌ Нельзя удалить администратора.")
     else:
-        bot.send_message(uid, "❌ Такой модератор не найден.")
+        bot.send_message(uid, "❌ Не найден.")
 
 @bot.message_handler(commands=["listmods"])
 def cmd_listmods(message):
-    uid = message.from_user.id
-    if not is_moderator(uid):
-        bot.send_message(uid, "❌ Нет доступа.")
+    if not is_moderator(message.from_user.id):
+        bot.send_message(message.from_user.id, "❌ Нет доступа.")
         return
     data = load_moderators()
-    text = "👥 *Список модераторов*\n\n"
-    text += f"*Администраторы:* {', '.join(map(str, data['admins'])) or 'нет'}\n"
-    text += f"*Модераторы:* {', '.join(map(str, data['moderators'])) or 'нет'}"
-    bot.send_message(uid, text, parse_mode="Markdown")
+    text = (f"👥 *Модераторы*\n"
+            f"Админы: {', '.join(map(str, data['admins'])) or 'нет'}\n"
+            f"Модераторы: {', '.join(map(str, data['moderators'])) or 'нет'}")
+    bot.send_message(message.from_user.id, text, parse_mode="Markdown")
 
 @bot.message_handler(commands=["pending"])
 def cmd_pending(message):
@@ -141,32 +145,20 @@ def cmd_pending(message):
     if not is_moderator(uid):
         bot.send_message(uid, "❌ Нет доступа.")
         return
-    if not pending_photos:
-        bot.send_message(uid, "📭 Нет фотографий на проверке.")
+    pending = {sid: s for sid, s in submissions.items() if s["status"] == "pending"}
+    if not pending:
+        bot.send_message(uid, "📭 Нет заявок на проверке.")
         return
-    bot.send_message(uid, f"📋 Фотографий на проверке: {len(pending_photos)}")
-    for pid, info in list(pending_photos.items()):
-        send_photo_to_mod(uid, pid, info)
+    bot.send_message(uid, f"📋 Заявок на проверке: {len(pending)}")
+    for sid, sub in pending.items():
+        send_submission_to_mod(uid, sid, sub)
 
-def send_photo_to_mod(mod_id, pid, info):
-    markup = types.InlineKeyboardMarkup()
-    markup.row(
-        types.InlineKeyboardButton("✅ Принять", callback_data=f"a_{pid}"),
-        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"r_{pid}")
-    )
-    try:
-        bot.send_photo(
-            mod_id,
-            info["file_id"],
-            caption=f"👤 От: {info['user_name']} (ID: {info['user_id']})\n📸 Фото на проверке",
-            reply_markup=markup
-        )
-    except Exception as e:
-        print(f"Ошибка отправки модератору {mod_id}: {e}")
+# ── Приём фото от пользователя ───────────────────────────
 
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     uid = message.from_user.id
+
     if uid in waiting_rejection_reason:
         bot.send_message(uid, "⚠️ Сначала введите причину отклонения текстом.")
         return
@@ -174,36 +166,104 @@ def handle_photo(message):
     file_id = message.photo[-1].file_id
     user_name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
 
-    pid = next_id()
-    pending_photos[pid] = {
-        "file_id": file_id,
+    if uid not in photo_buffer:
+        photo_buffer[uid] = {"photos": [], "user_name": user_name, "notified": False}
+
+    photo_buffer[uid]["photos"].append(file_id)
+    photo_buffer[uid]["last_time"] = time.time()
+
+    # Уведомляем пользователя только один раз
+    if not photo_buffer[uid]["notified"]:
+        photo_buffer[uid]["notified"] = True
+        bot.send_message(uid, "📤 Получаю фото... Отправьте все нужные и подождите немного.")
+
+    # Запускаем отложенную отправку
+    import threading
+    t = threading.Timer(BUFFER_SECONDS, flush_buffer, args=[uid])
+    t.daemon = True
+    t.start()
+
+def flush_buffer(uid):
+    if uid not in photo_buffer:
+        return
+
+    buf = photo_buffer[uid]
+    # Проверяем что прошло достаточно времени с последнего фото
+    if time.time() - buf["last_time"] < BUFFER_SECONDS - 0.1:
+        return  # Ещё идут фото, другой таймер подхватит
+
+    photos = buf["photos"]
+    user_name = buf["user_name"]
+    del photo_buffer[uid]
+
+    sid = next_sid()
+    submissions[sid] = {
         "user_id": uid,
         "user_name": user_name,
+        "photos": photos,
+        "status": "pending"
     }
 
-    bot.send_message(uid, "📤 Ваше фото отправлено на проверку. Ожидайте решения.")
+    bot.send_message(uid, f"✅ Заявка #{sid} отправлена на проверку ({len(photos)} фото). Ожидайте решения.")
 
     mods = get_all_mods()
     if not mods:
-        bot.send_message(uid, "⚠️ Модераторы ещё не назначены.")
+        bot.send_message(uid, "⚠️ Модераторы не назначены.")
         return
 
     for mod_id in mods:
-        send_photo_to_mod(mod_id, pid, pending_photos[pid])
+        send_submission_to_mod(mod_id, sid, submissions[sid])
+
+# ── Отправка заявки модератору ───────────────────────────
+
+def send_submission_to_mod(mod_id, sid, sub):
+    photos = sub["photos"]
+    user_name = sub["user_name"]
+    user_id = sub["user_id"]
+    count = len(photos)
+
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton(f"✅ Принять все ({count})", callback_data=f"a_{sid}"),
+        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"r_{sid}")
+    )
+
+    try:
+        if count == 1:
+            # Одно фото — отправляем с кнопками сразу
+            bot.send_photo(
+                mod_id,
+                photos[0],
+                caption=f"👤 {user_name} (ID: {user_id})\n📸 1 фото | Заявка #{sid}",
+                reply_markup=markup
+            )
+        else:
+            # Несколько фото — отправляем альбомом, потом кнопки
+            media = [types.InputMediaPhoto(pid) for pid in photos]
+            media[0].caption = f"👤 {user_name} (ID: {user_id}) | {count} фото | Заявка #{sid}"
+            bot.send_media_group(mod_id, media)
+            bot.send_message(
+                mod_id,
+                f"☝️ Заявка #{sid} от {user_name} — {count} фото",
+                reply_markup=markup
+            )
+    except Exception as e:
+        print(f"Ошибка отправки модератору {mod_id}: {e}")
+
+# ── Обработка кнопок ─────────────────────────────────────
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("a_") or call.data.startswith("r_"))
 def handle_decision(call):
     mod_id = call.from_user.id
     if not is_moderator(mod_id):
-        bot.answer_callback_query(call.id, "❌ У вас нет прав модератора.")
+        bot.answer_callback_query(call.id, "❌ Нет прав.")
         return
 
-    parts = call.data.split("_", 1)
-    action, pid = parts[0], parts[1]
-    info = pending_photos.get(pid)
+    action, sid = call.data.split("_", 1)
+    sub = submissions.get(sid)
 
-    if not info:
-        bot.answer_callback_query(call.id, "⚠️ Фото уже обработано.")
+    if not sub or sub["status"] != "pending":
+        bot.answer_callback_query(call.id, "⚠️ Заявка уже обработана.")
         try:
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         except:
@@ -211,32 +271,38 @@ def handle_decision(call):
         return
 
     if action == "a":
-        user_id = info["user_id"]
-        del pending_photos[pid]
+        sub["status"] = "approved"
         try:
-            bot.send_message(user_id, "✅ Ваше фото *принято* модератором!", parse_mode="Markdown")
+            bot.send_message(sub["user_id"],
+                f"✅ Ваша заявка #{sid} *принята!*",
+                parse_mode="Markdown"
+            )
         except Exception as e:
             print(f"Ошибка уведомления: {e}")
         try:
-            bot.edit_message_caption(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                caption=f"✅ *Принято*\n👤 {info['user_name']} (ID: {info['user_id']})",
-                parse_mode="Markdown",
+            bot.edit_message_text(
+                f"✅ Заявка #{sid} принята\n👤 {sub['user_name']} | {len(sub['photos'])} фото",
+                call.message.chat.id,
+                call.message.message_id,
                 reply_markup=None
             )
         except:
-            pass
+            try:
+                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            except:
+                pass
         bot.answer_callback_query(call.id, "✅ Принято!")
 
     elif action == "r":
         waiting_rejection_reason[mod_id] = {
-            "pid": pid,
+            "sid": sid,
             "chat_id": call.message.chat.id,
             "message_id": call.message.message_id
         }
         bot.answer_callback_query(call.id, "Введите причину")
-        bot.send_message(mod_id, "✏️ Напишите причину отклонения:")
+        bot.send_message(mod_id, f"✏️ Причина отклонения заявки #{sid}:")
+
+# ── Причина отклонения ───────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.from_user.id in waiting_rejection_reason, content_types=["text"])
 def handle_rejection_reason(message):
@@ -244,39 +310,41 @@ def handle_rejection_reason(message):
     reason = message.text
     state = waiting_rejection_reason.pop(mod_id)
 
-    pid = state["pid"]
-    info = pending_photos.get(pid)
+    sid = state["sid"]
+    sub = submissions.get(sid)
 
-    if not info:
-        bot.send_message(mod_id, "⚠️ Фото уже обработано другим модератором.")
+    if not sub or sub["status"] != "pending":
+        bot.send_message(mod_id, "⚠️ Заявка уже обработана.")
         return
 
-    user_id = info["user_id"]
-    del pending_photos[pid]
+    sub["status"] = "rejected"
 
     try:
         bot.send_message(
-            user_id,
-            f"❌ Ваше фото *отклонено*.\n\n📝 *Причина:* {reason}",
+            sub["user_id"],
+            f"❌ Заявка #{sid} *отклонена*\n\n📝 *Причина:* {reason}",
             parse_mode="Markdown"
         )
     except Exception as e:
         print(f"Ошибка уведомления: {e}")
 
     try:
-        bot.edit_message_caption(
-            chat_id=state["chat_id"],
-            message_id=state["message_id"],
-            caption=f"❌ *Отклонено*\n👤 {info['user_name']} (ID: {info['user_id']})\n📝 Причина: {reason}",
-            parse_mode="Markdown",
+        bot.edit_message_text(
+            f"❌ Заявка #{sid} отклонена\n👤 {sub['user_name']}\n📝 {reason}",
+            state["chat_id"],
+            state["message_id"],
             reply_markup=None
         )
     except:
-        pass
+        try:
+            bot.edit_message_reply_markup(state["chat_id"], state["message_id"], reply_markup=None)
+        except:
+            pass
 
-    bot.send_message(mod_id, "✅ Решение отправлено пользователю.")
+    bot.send_message(mod_id, "✅ Решение отправлено.")
+
+# ── Запуск ───────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("🤖 Бот запущен...")
-    print("Первый запуск: напишите боту /setup чтобы стать администратором")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
