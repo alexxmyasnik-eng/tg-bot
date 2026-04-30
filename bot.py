@@ -3,9 +3,11 @@ from telebot import types
 import json
 import os
 import time
+import threading
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MODERATORS_FILE = "moderators.json"
+REQUIRED_PHOTOS = 25  # Минимум фото для отправки заявки
 
 def load_moderators():
     if os.path.exists(MODERATORS_FILE):
@@ -28,14 +30,13 @@ def is_moderator(user_id):
     return user_id in get_all_mods()
 
 # Хранилище заявок
-# submissions[sid] = {"user_id": ..., "user_name": ..., "photos": [file_id, ...], "status": "pending"}
 submissions = {}
 sub_counter = [0]
 
-# Буфер для группировки фото от одного пользователя
-# buffer[user_id] = {"photos": [...], "timer": timestamp}
+# Буфер фото от пользователей
+# buffer[user_id] = {"photos": [...], "user_name": ..., "last_time": ..., "timer": ..., "status_msg_id": ...}
 photo_buffer = {}
-BUFFER_SECONDS = 3  # ждём 3 секунды после последнего фото
+BUFFER_SECONDS = 4
 
 waiting_rejection_reason = {}
 
@@ -60,9 +61,9 @@ def cmd_start(message):
         )
     else:
         bot.send_message(uid,
-            "👋 Привет!\n\n"
-            "Отправь фотографии (можно сразу несколько) — они попадут на проверку.\n"
-            "Ты получишь уведомление о решении."
+            f"👋 Привет!\n\n"
+            f"Для отправки заявки нужно прислать минимум {REQUIRED_PHOTOS} фотографий.\n"
+            f"Отправляй их подряд — бот сам их все соберёт."
         )
 
 @bot.message_handler(commands=["setup"])
@@ -167,33 +168,110 @@ def handle_photo(message):
     user_name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
 
     if uid not in photo_buffer:
-        photo_buffer[uid] = {"photos": [], "user_name": user_name, "notified": False}
-
-    photo_buffer[uid]["photos"].append(file_id)
-    photo_buffer[uid]["last_time"] = time.time()
-
-    # Уведомляем пользователя только один раз
-    if not photo_buffer[uid]["notified"]:
-        photo_buffer[uid]["notified"] = True
-        bot.send_message(uid, "📤 Получаю фото... Отправьте все нужные и подождите немного.")
-
-    # Запускаем отложенную отправку
-    import threading
-    t = threading.Timer(BUFFER_SECONDS, flush_buffer, args=[uid])
-    t.daemon = True
-    t.start()
-
-def flush_buffer(uid):
-    if uid not in photo_buffer:
-        return
+        photo_buffer[uid] = {
+            "photos": [],
+            "user_name": user_name,
+            "last_time": 0,
+            "status_msg_id": None,
+            "timer": None
+        }
 
     buf = photo_buffer[uid]
-    # Проверяем что прошло достаточно времени с последнего фото
+    buf["photos"].append(file_id)
+    buf["last_time"] = time.time()
+    count = len(buf["photos"])
+    remaining = REQUIRED_PHOTOS - count
+
+    # Отменяем предыдущий таймер
+    if buf["timer"] is not None:
+        buf["timer"].cancel()
+
+    if remaining > 0:
+        # Обновляем или отправляем статусное сообщение
+        status_text = (
+            f"📷 Получено фото: *{count}*\n"
+            f"⏳ Осталось добавить: *{remaining}*\n\n"
+            f"Продолжай отправлять фото..."
+        )
+        try:
+            if buf["status_msg_id"]:
+                bot.edit_message_text(
+                    status_text,
+                    uid,
+                    buf["status_msg_id"],
+                    parse_mode="Markdown"
+                )
+            else:
+                msg = bot.send_message(uid, status_text, parse_mode="Markdown")
+                buf["status_msg_id"] = msg.message_id
+        except:
+            try:
+                msg = bot.send_message(uid, status_text, parse_mode="Markdown")
+                buf["status_msg_id"] = msg.message_id
+            except:
+                pass
+
+        # Таймер — если пользователь перестал слать фото но не набрал 25
+        t = threading.Timer(BUFFER_SECONDS, check_incomplete, args=[uid])
+        t.daemon = True
+        buf["timer"] = t
+        t.start()
+
+    else:
+        # Набрано 25+ фото — отправляем заявку
+        try:
+            if buf["status_msg_id"]:
+                bot.edit_message_text(
+                    f"✅ Все {count} фото получены! Отправляю на проверку...",
+                    uid,
+                    buf["status_msg_id"]
+                )
+        except:
+            pass
+
+        # Таймер чтобы дать телеграму время доставить все фото
+        t = threading.Timer(BUFFER_SECONDS, flush_buffer, args=[uid])
+        t.daemon = True
+        buf["timer"] = t
+        t.start()
+
+def check_incomplete(uid):
+    """Вызывается если пользователь перестал слать фото, но не набрал минимум."""
+    if uid not in photo_buffer:
+        return
+    buf = photo_buffer[uid]
+    # Если за это время пришли ещё фото — другой таймер разберётся
     if time.time() - buf["last_time"] < BUFFER_SECONDS - 0.1:
-        return  # Ещё идут фото, другой таймер подхватит
+        return
+    count = len(buf["photos"])
+    if count >= REQUIRED_PHOTOS:
+        return  # flush_buffer уже запущен
+    remaining = REQUIRED_PHOTOS - count
+    try:
+        status_text = (
+            f"📷 Сейчас у тебя: *{count}* фото\n"
+            f"❗ Нужно ещё: *{remaining}*\n\n"
+            f"Отправь ещё фото чтобы завершить заявку."
+        )
+        if buf["status_msg_id"]:
+            bot.edit_message_text(status_text, uid, buf["status_msg_id"], parse_mode="Markdown")
+        else:
+            msg = bot.send_message(uid, status_text, parse_mode="Markdown")
+            buf["status_msg_id"] = msg.message_id
+    except:
+        pass
+
+def flush_buffer(uid):
+    """Собирает все фото и отправляет заявку модераторам."""
+    if uid not in photo_buffer:
+        return
+    buf = photo_buffer[uid]
+    if time.time() - buf["last_time"] < BUFFER_SECONDS - 0.1:
+        return
 
     photos = buf["photos"]
     user_name = buf["user_name"]
+    status_msg_id = buf["status_msg_id"]
     del photo_buffer[uid]
 
     sid = next_sid()
@@ -204,7 +282,18 @@ def flush_buffer(uid):
         "status": "pending"
     }
 
-    bot.send_message(uid, f"✅ Заявка #{sid} отправлена на проверку ({len(photos)} фото). Ожидайте решения.")
+    try:
+        if status_msg_id:
+            bot.edit_message_text(
+                f"✅ Заявка *#{sid}* отправлена на проверку ({len(photos)} фото).\nОжидай решения модератора.",
+                uid,
+                status_msg_id,
+                parse_mode="Markdown"
+            )
+        else:
+            bot.send_message(uid, f"✅ Заявка *#{sid}* отправлена на проверку ({len(photos)} фото).", parse_mode="Markdown")
+    except:
+        bot.send_message(uid, f"✅ Заявка *#{sid}* отправлена на проверку ({len(photos)} фото).", parse_mode="Markdown")
 
     mods = get_all_mods()
     if not mods:
@@ -224,29 +313,40 @@ def send_submission_to_mod(mod_id, sid, sub):
 
     markup = types.InlineKeyboardMarkup()
     markup.row(
-        types.InlineKeyboardButton(f"✅ Принять все ({count})", callback_data=f"a_{sid}"),
+        types.InlineKeyboardButton(f"✅ Принять ({count} фото)", callback_data=f"a_{sid}"),
         types.InlineKeyboardButton("❌ Отклонить", callback_data=f"r_{sid}")
     )
 
     try:
-        if count == 1:
-            # Одно фото — отправляем с кнопками сразу
-            bot.send_photo(
-                mod_id,
-                photos[0],
-                caption=f"👤 {user_name} (ID: {user_id})\n📸 1 фото | Заявка #{sid}",
-                reply_markup=markup
-            )
-        else:
-            # Несколько фото — отправляем альбомом, потом кнопки
-            media = [types.InputMediaPhoto(pid) for pid in photos]
-            media[0].caption = f"👤 {user_name} (ID: {user_id}) | {count} фото | Заявка #{sid}"
-            bot.send_media_group(mod_id, media)
+        # Telegram позволяет максимум 10 фото в альбоме
+        # Отправляем по 10, последняя группа с кнопками
+        chunks = [photos[i:i+10] for i in range(0, count, 10)]
+
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            media = [types.InputMediaPhoto(fid) for fid in chunk]
+
+            if i == 0:
+                media[0].caption = f"👤 {user_name} (ID: {user_id}) | Заявка #{sid} | {count} фото"
+
+            if is_last and len(chunk) == 1:
+                # Последний чанк из 1 фото — отправляем с кнопками
+                bot.send_photo(mod_id, chunk[0],
+                    caption=media[0].caption if i == 0 else f"Заявка #{sid} — продолжение",
+                    reply_markup=markup
+                )
+            else:
+                bot.send_media_group(mod_id, media)
+
+        # Если последний чанк был больше 1 — отправляем кнопки отдельным сообщением
+        if len(chunks[-1]) > 1:
             bot.send_message(
                 mod_id,
-                f"☝️ Заявка #{sid} от {user_name} — {count} фото",
-                reply_markup=markup
+                f"☝️ Заявка *#{sid}* от {user_name} — {count} фото",
+                reply_markup=markup,
+                parse_mode="Markdown"
             )
+
     except Exception as e:
         print(f"Ошибка отправки модератору {mod_id}: {e}")
 
@@ -274,16 +374,17 @@ def handle_decision(call):
         sub["status"] = "approved"
         try:
             bot.send_message(sub["user_id"],
-                f"✅ Ваша заявка #{sid} *принята!*",
+                f"✅ Заявка *#{sid}* принята! Поздравляем 🎉",
                 parse_mode="Markdown"
             )
         except Exception as e:
             print(f"Ошибка уведомления: {e}")
         try:
             bot.edit_message_text(
-                f"✅ Заявка #{sid} принята\n👤 {sub['user_name']} | {len(sub['photos'])} фото",
+                f"✅ Заявка #{sid} *принята*\n👤 {sub['user_name']} | {len(sub['photos'])} фото",
                 call.message.chat.id,
                 call.message.message_id,
+                parse_mode="Markdown",
                 reply_markup=None
             )
         except:
@@ -300,7 +401,7 @@ def handle_decision(call):
             "message_id": call.message.message_id
         }
         bot.answer_callback_query(call.id, "Введите причину")
-        bot.send_message(mod_id, f"✏️ Причина отклонения заявки #{sid}:")
+        bot.send_message(mod_id, f"✏️ Причина отклонения заявки *#{sid}*:", parse_mode="Markdown")
 
 # ── Причина отклонения ───────────────────────────────────
 
@@ -322,7 +423,7 @@ def handle_rejection_reason(message):
     try:
         bot.send_message(
             sub["user_id"],
-            f"❌ Заявка #{sid} *отклонена*\n\n📝 *Причина:* {reason}",
+            f"❌ Заявка *#{sid}* отклонена\n\n📝 *Причина:* {reason}",
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -330,9 +431,10 @@ def handle_rejection_reason(message):
 
     try:
         bot.edit_message_text(
-            f"❌ Заявка #{sid} отклонена\n👤 {sub['user_name']}\n📝 {reason}",
+            f"❌ Заявка #{sid} *отклонена*\n👤 {sub['user_name']}\n📝 {reason}",
             state["chat_id"],
             state["message_id"],
+            parse_mode="Markdown",
             reply_markup=None
         )
     except:
