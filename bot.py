@@ -423,7 +423,7 @@ def handle_decision(call):
         sub["status"] = "approved"
         try:
             bot.send_message(sub["user_id"],
-                f"✅ Заявка *#{sid}* принята! Поздравляем 🎉",
+                f"✅ Заявка *#{sid}* принята! Поздравляем 🎉\n\n🔗 Вот ссылка на канал:\nhttps://t.me/+h8-bosKlV0o5OWU6",
                 parse_mode="Markdown"
             )
         except Exception as e:
