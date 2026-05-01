@@ -8,6 +8,7 @@ import threading
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MODERATORS_FILE = "moderators.json"
 REQUIRED_PHOTOS = 25  # Минимум фото для отправки заявки
+CHANNEL_USERNAME = "Zonvate"  # Канал без @
 
 def load_moderators():
     if os.path.exists(MODERATORS_FILE):
@@ -46,6 +47,29 @@ def next_sid():
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# ── Проверка подписки ────────────────────────────────────
+
+def is_subscribed(user_id):
+    try:
+        member = bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except:
+        return False
+
+def send_subscribe_prompt(uid):
+    markup = types.InlineKeyboardMarkup()
+    markup.row(types.InlineKeyboardButton("📢 Подписаться на канал", url=f"https://t.me/{CHANNEL_USERNAME}"))
+    markup.row(types.InlineKeyboardButton("✅ Проверить подписку", callback_data="check_sub"))
+    bot.send_message(
+        uid,
+        "👋 Привет!\n\n"
+        "Для использования бота необходимо подписаться на наш канал.\n\n"
+        "1️⃣ Нажми *Подписаться на канал*\n"
+        "2️⃣ Нажми *Проверить подписку*",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
 # ── Команды ──────────────────────────────────────────────
 
 @bot.message_handler(commands=["start"])
@@ -59,6 +83,8 @@ def cmd_start(message):
             "/removemod ID — удалить модератора\n"
             "/listmods — список модераторов"
         )
+    elif not is_subscribed(uid):
+        send_subscribe_prompt(uid)
     else:
         bot.send_message(uid,
             f"👋 Привет!\n\n"
@@ -162,6 +188,11 @@ def handle_photo(message):
 
     if uid in waiting_rejection_reason:
         bot.send_message(uid, "⚠️ Сначала введите причину отклонения текстом.")
+        return
+
+    # Проверка подписки для обычных пользователей
+    if not is_moderator(uid) and not is_subscribed(uid):
+        send_subscribe_prompt(uid)
         return
 
     file_id = message.photo[-1].file_id
@@ -352,6 +383,24 @@ def send_submission_to_mod(mod_id, sid, sub):
 
 # ── Обработка кнопок ─────────────────────────────────────
 
+@bot.callback_query_handler(func=lambda call: call.data == "check_sub")
+def handle_check_sub(call):
+    uid = call.from_user.id
+    if is_subscribed(uid):
+        bot.answer_callback_query(call.id, "✅ Подписка подтверждена!")
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
+        bot.send_message(
+            uid,
+            f"👋 Привет!\n\n"
+            f"Для отправки заявки нужно прислать минимум {REQUIRED_PHOTOS} фотографий.\n"
+            f"Отправляй их подряд — бот сам их все соберёт."
+        )
+    else:
+        bot.answer_callback_query(call.id, "❌ Вы ещё не подписаны!", show_alert=True)
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("a_") or call.data.startswith("r_"))
 def handle_decision(call):
     mod_id = call.from_user.id
@@ -374,7 +423,7 @@ def handle_decision(call):
         sub["status"] = "approved"
         try:
             bot.send_message(sub["user_id"],
-                f"✅ Заявка *#{sid}* принята! Поздравляем 🎉\n\n🔗 Вот ссылка на канал:\nhttps://t.me/+h8-bosKlV0o5OWU6",
+                f"✅ Заявка *#{sid}* принята! Поздравляем 🎉",
                 parse_mode="Markdown"
             )
         except Exception as e:
